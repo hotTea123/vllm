@@ -12,7 +12,7 @@ import numpy as np
 from vllm import envs
 from vllm.compilation.cuda_graph import CUDAGraphStat
 from vllm.config import VllmConfig
-from vllm.config.score_encoder_cache import get_score_encoder_cache_config
+from vllm.config.score_encoder_cache import get_encoder_cache_manager_config
 from vllm.distributed.ec_transfer.ec_connector.base import (
     ECConnectorMetadata,
     ECConnectorRole,
@@ -214,10 +214,11 @@ class Scheduler(SchedulerInterface):
 
         if self.log_stats:
             self.mm_cache_stats = MultiModalCacheStats()
-  
-        if get_score_encoder_cache_config(vllm_config).enabled:
-            self.encoder_cache_manager = ScoreEncoderCacheManager(cache_size=encoder_cache_size, 
-                                                      vllm_config=self.vllm_config)
+
+        if get_encoder_cache_manager_config(vllm_config).enabled:
+            self.encoder_cache_manager = ScoreEncoderCacheManager(
+                cache_size=encoder_cache_size, vllm_config=self.vllm_config
+            )
 
         speculative_config = vllm_config.speculative_config
         self.use_eagle = False

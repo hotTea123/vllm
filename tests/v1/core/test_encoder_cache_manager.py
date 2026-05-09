@@ -2,11 +2,14 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import pytest
 import torch
+from types import SimpleNamespace
 
+from vllm.config.score_encoder_cache import get_encoder_cache_manager_config
 from vllm.multimodal.inputs import MultiModalFeatureSpec, PlaceholderRange
 from vllm.v1.core.encoder_cache_manager import (
     EncoderCacheManager,
     EncoderDecoderCacheManager,
+    ScoreEncoderCacheManager,
 )
 
 pytestmark = pytest.mark.cpu_test
@@ -335,3 +338,56 @@ def test_encoder_decoder_cache_manager_reset_allows_fresh_allocations():
 
     assert manager.num_free_slots == 2
     assert "img2" in manager.allocated
+
+
+def _mock_vllm_config(additional_config):
+    vision_cfg = SimpleNamespace(num_heads=8, hidden_size=64, intermediate_size=128)
+    hf_config = SimpleNamespace(vision_config=vision_cfg)
+    model_config = SimpleNamespace(hf_config=hf_config)
+    return SimpleNamespace(model_config=model_config,
+                           additional_config=additional_config)
+
+
+def test_encoder_cache_manager_config_legacy_compatibility():
+    vllm_config = _mock_vllm_config(
+        {"score_encoder_cache_config": {
+            "enabled": True,
+            "cpu_cache_slots": 1024,
+            "max_clock": 7,
+        }})
+    cfg = get_encoder_cache_manager_config(vllm_config)
+    assert cfg.enabled
+    assert cfg.hierarchy_type == "dram_hbm"
+    assert cfg.eviction_policy == "score"
+    assert cfg.cpu_cache_slots == 1024
+    assert cfg.score_policy.max_clock == 7
+
+
+def test_score_encoder_cache_manager_hbm_only_hierarchy():
+    vllm_config = _mock_vllm_config(
+        {"encoder_cache_manager_config": {
+            "enabled": True,
+            "hierarchy_type": "hbm_only",
+            "eviction_policy": "score",
+            "default_write_cache": "hbm",
+        }})
+    manager = ScoreEncoderCacheManager(cache_size=10, vllm_config=vllm_config)
+    req = MockRequest("req1", ["h1"], [4])
+
+    assert manager.can_allocate(req, 0, int(1e9), 0)
+    manager.allocate(req, 0)
+    manager.free_encoder_input(req, 0)
+
+    assert manager.check_and_update_cache(req, 0)
+    assert manager.get_promoting_mm_hashes() == []
+    assert manager.get_cpu_get_encoder_mm_hashes() == []
+
+
+def test_score_encoder_cache_manager_invalid_policy():
+    vllm_config = _mock_vllm_config(
+        {"encoder_cache_manager_config": {
+            "enabled": True,
+            "eviction_policy": "lru",
+        }})
+    with pytest.raises(ValueError, match="Unsupported encoder eviction policy"):
+        ScoreEncoderCacheManager(cache_size=10, vllm_config=vllm_config)
