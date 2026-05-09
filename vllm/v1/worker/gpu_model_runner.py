@@ -31,7 +31,7 @@ from vllm.config import (
     get_layers_from_vllm_config,
     update_config,
 )
-from vllm.config.score_encoder_cache import get_score_encoder_cache_config
+from vllm.config.score_encoder_cache import get_encoder_cache_manager_config
 from vllm.config.cache import CacheConfig
 from vllm.distributed.ec_transfer import get_ec_transfer, has_ec_transfer
 from vllm.distributed.eplb.eplb_state import EplbState
@@ -1057,7 +1057,7 @@ class GPUModelRunner(
         torch.accelerator.synchronize()
 
     def free_tmp_cache(self, req_id, request):
-        if not get_score_encoder_cache_config(self.vllm_config).enabled:
+        if not get_encoder_cache_manager_config(self.vllm_config).enabled:
             self.cached.clear()
             return
         free_mm_hashes = set()
@@ -2933,7 +2933,7 @@ class GPUModelRunner(
 
         # Cache the encoder outputs by mm_hash
         for mm_hash, output in zip(mm_hashes, encoder_outputs):
-            if get_score_encoder_cache_config(self.vllm_config).enabled:
+            if get_encoder_cache_manager_config(self.vllm_config).enabled:
                 staging = torch.empty_like(
                     output,
                     device="cpu",
