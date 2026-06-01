@@ -7,7 +7,7 @@ import itertools
 import threading
 import time
 from collections import defaultdict
-from collections.abc import Callable, Iterable, Iterator, Sequence
+from collections.abc import Iterable, Iterator, Sequence
 from contextlib import contextmanager
 from copy import copy, deepcopy
 from dataclasses import dataclass, replace
@@ -29,10 +29,11 @@ from vllm.config import (
     CUDAGraphMode,
     VllmConfig,
     get_layers_from_vllm_config,
+    set_current_vllm_config,
     update_config,
 )
-from vllm.config.score_encoder_cache import get_score_encoder_cache_config
 from vllm.config.cache import CacheConfig
+from vllm.config.score_encoder_cache import get_score_encoder_cache_config
 from vllm.distributed.ec_transfer import get_ec_transfer, has_ec_transfer
 from vllm.distributed.eplb.eplb_state import EplbState
 from vllm.distributed.kv_transfer import get_kv_transfer_group, has_kv_transfer_group
@@ -1072,39 +1073,74 @@ class GPUModelRunner(
                 del self.cached[mm_hash]
                 if mm_hash in self.tmp_encoder_cache:
                     del self.tmp_encoder_cache[mm_hash]
-    
-    def _async_process_scheduler_output(self, scheduler_output: "SchedulerOutput") -> None:
+
+    def _async_process_scheduler_output(
+        self, scheduler_output: "SchedulerOutput"
+    ) -> None:
         # Free the cached encoder outputs.
         for mm_hash in scheduler_output.free_encoder_mm_hashes:
             value = self.encoder_cache.pop(mm_hash, None)
             if value is None and mm_hash not in scheduler_output.promoting_mm_hashes:
                 self.cpu_encoder_cache.pop(mm_hash, None)
 
-        # Handle promotion: move selected cache entries from CPU to device (e.g., GPU/NPU).
+        # Handle promotion: move selected cache entries from CPU to device.
         for mm_hash in scheduler_output.promoting_mm_hashes:
             cpu_value = self.cpu_encoder_cache.get(mm_hash, None)
             if cpu_value is None:
                 continue
-            
-            staging = cpu_value.pin_memory()
-            gpu_value = staging.detach().to(self.device, non_blocking=True)
-            gpu_value.record_stream(torch.cuda.current_stream())
 
-            self.encoder_cache[mm_hash] = gpu_value
-            del staging
+            self.encoder_cache[mm_hash] = self._copy_cpu_encoder_cache_to_device(
+                cpu_value, non_blocking=True
+            )
 
-        # Handle CPU fetch requests: load required cache entries from CPU to temporary device cache.
+        # Handle CPU fetch requests: load required cache entries from CPU to
+        # temporary device cache.
         for mm_hash in scheduler_output.cpu_get_encoder_mm_hashes:
             if mm_hash in self.encoder_cache or mm_hash in self.tmp_encoder_cache:
                 continue
             cpu_value = self.cpu_encoder_cache.get(mm_hash, None)
             if cpu_value is None:
                 continue
-            staging = cpu_value.pin_memory()
-            gpu_value = staging.detach().to(self.device, non_blocking=True)
-            gpu_value.record_stream(torch.cuda.current_stream())
-            self.tmp_encoder_cache[mm_hash] = gpu_value
-            del staging
+            self.tmp_encoder_cache[mm_hash] = self._copy_cpu_encoder_cache_to_device(
+                cpu_value, non_blocking=True
+            )
+
+    def _copy_cpu_encoder_cache_to_device(
+        self, cpu_value: torch.Tensor, *, non_blocking: bool
+    ) -> torch.Tensor:
+        if torch.device(self.device).type == "cpu":
+            return cpu_value.detach().to(self.device)
+
+        device_value = cpu_value.detach().to(self.device, non_blocking=non_blocking)
+        if device_value.is_cuda:
+            device_value.record_stream(torch.cuda.current_stream())
+        return device_value
+
+    def _get_encoder_output_from_cache(self, mm_hash: str) -> torch.Tensor | None:
+        encoder_output = self.encoder_cache.get(mm_hash, None)
+        if encoder_output is not None:
+            return encoder_output
+
+        encoder_output = self.tmp_encoder_cache.get(mm_hash, None)
+        if encoder_output is not None:
+            return encoder_output
+
+        if not get_score_encoder_cache_config(self.vllm_config).enabled:
+            return None
+
+        cpu_value = self.cpu_encoder_cache.get(mm_hash, None)
+        if cpu_value is None:
+            return None
+
+        # The score encoder cache scheduler asks the worker to stage CPU cache
+        # hits into a device cache before gather.  Keep a defensive synchronous
+        # fallback here so a stale worker-side temporary entry cannot turn a
+        # scheduler CPU-cache hit into an engine-fatal cache miss.
+        encoder_output = self._copy_cpu_encoder_cache_to_device(
+            cpu_value, non_blocking=False
+        )
+        self.tmp_encoder_cache[mm_hash] = encoder_output
+        return encoder_output
 
     def _update_states(self, scheduler_output: "SchedulerOutput") -> None:
         """Update the cached states and the persistent batch with the scheduler
@@ -1140,10 +1176,6 @@ class GPUModelRunner(
         # stale NaN/data from corrupting attention or SSM computation.
         if scheduler_output.new_block_ids_to_zero:
             self._zero_block_ids(scheduler_output.new_block_ids_to_zero)
-
-        # Free the cached encoder outputs.
-        for mm_hash in scheduler_output.free_encoder_mm_hashes:
-            self.encoder_cache.pop(mm_hash, None)
 
         # Remove the unscheduled requests from the persistent batch.
         # NOTE(woosuk): The unscheduled requests are either preempted requests
@@ -3018,9 +3050,7 @@ class GPUModelRunner(
                     continue
 
                 mm_hash = mm_feature.identifier
-                encoder_output = self.encoder_cache.get(mm_hash, None)
-                if encoder_output is None:
-                    encoder_output = self.tmp_encoder_cache.get(mm_hash, None)
+                encoder_output = self._get_encoder_output_from_cache(mm_hash)
                 assert encoder_output is not None, f"Encoder cache miss for {mm_hash}"
 
                 if (is_embed := pos_info.is_embed) is not None:

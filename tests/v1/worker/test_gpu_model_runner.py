@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+from types import SimpleNamespace
+
 import numpy as np
 import pytest
 import torch
@@ -156,6 +158,8 @@ def _schedule_new_request(*req_ids: str) -> SchedulerOutput:
         num_common_prefix_blocks=[],
         finished_req_ids=set(),
         free_encoder_mm_hashes=[],
+        promoting_mm_hashes=[],
+        cpu_get_encoder_mm_hashes=[],
     )
 
 
@@ -183,6 +187,51 @@ def _is_req_state_block_table_match(model_runner, req_id: str) -> bool:
     return (
         block_table.block_table.np[req_index, :num_blocks] == req_state.block_ids[0]
     ).all()
+
+
+def test_score_encoder_cache_promotion_survives_free_list():
+    runner = GPUModelRunner.__new__(GPUModelRunner)
+    mm_hash = "img"
+    runner.encoder_cache = {}
+    runner.tmp_encoder_cache = {}
+    runner.cpu_encoder_cache = {mm_hash: torch.tensor([1.0])}
+    runner.device = torch.device("cpu")
+
+    scheduler_output = SchedulerOutput(
+        scheduled_new_reqs=[],
+        scheduled_cached_reqs=CachedRequestData.make_empty(),
+        num_scheduled_tokens={},
+        total_num_scheduled_tokens=0,
+        scheduled_spec_decode_tokens={},
+        scheduled_encoder_inputs={},
+        num_common_prefix_blocks=[],
+        finished_req_ids=set(),
+        free_encoder_mm_hashes=[mm_hash],
+        promoting_mm_hashes=[mm_hash],
+        cpu_get_encoder_mm_hashes=[],
+    )
+
+    runner._async_process_scheduler_output(scheduler_output)
+
+    assert mm_hash in runner.encoder_cache
+    assert mm_hash in runner.cpu_encoder_cache
+
+
+def test_score_encoder_cache_gather_falls_back_to_cpu_cache():
+    runner = GPUModelRunner.__new__(GPUModelRunner)
+    mm_hash = "img"
+    runner.encoder_cache = {}
+    runner.tmp_encoder_cache = {}
+    runner.cpu_encoder_cache = {mm_hash: torch.tensor([1.0])}
+    runner.device = torch.device("cpu")
+    runner.vllm_config = SimpleNamespace(
+        additional_config={"score_encoder_cache_config": {"enabled": True}}
+    )
+
+    encoder_output = runner._get_encoder_output_from_cache(mm_hash)
+
+    assert torch.equal(encoder_output, runner.cpu_encoder_cache[mm_hash])
+    assert runner.tmp_encoder_cache[mm_hash] is encoder_output
 
 
 def _make_mock_backend_for_kernel_block_size(
